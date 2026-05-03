@@ -1122,6 +1122,17 @@ class OpenAICompletion(BaseLLM):
                         }
                     )
 
+            # added support for reasoning summary chunks in streaming mode
+            elif event.type == "response.reasoning_summary_text.delta":
+                chunk = event.delta or ""
+                if chunk:
+                    self._emit_thinking_chunk_event(
+                        chunk=chunk,
+                        from_task=from_task,
+                        from_agent=from_agent,
+                        response_id=response_id_stream,
+                    )
+
             elif event.type == "response.completed":
                 final_response = event.response
                 # Track response ID for auto-chaining
