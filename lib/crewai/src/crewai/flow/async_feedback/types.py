@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
+
 if TYPE_CHECKING:
     from crewai.flow.flow import Flow
 
@@ -59,8 +60,34 @@ class PendingFeedbackContext:
     emit: list[str] | None = None
     default_outcome: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
-    llm: str | None = None
+    llm: dict[str, Any] | str | None = None
     requested_at: datetime = field(default_factory=datetime.now)
+
+    @staticmethod
+    def _make_json_safe(value: Any) -> Any:
+        """Convert a value to a JSON-serializable form.
+
+        Handles Pydantic models, dataclasses, and arbitrary objects by
+        progressively falling back to string representation.
+        """
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, (list, tuple)):
+            return [PendingFeedbackContext._make_json_safe(v) for v in value]
+        if isinstance(value, dict):
+            return {
+                k: PendingFeedbackContext._make_json_safe(v) for k, v in value.items()
+            }
+
+        from pydantic import BaseModel
+
+        if isinstance(value, BaseModel):
+            return value.model_dump(mode="json")
+        import dataclasses
+
+        if dataclasses.is_dataclass(value) and not isinstance(value, type):
+            return PendingFeedbackContext._make_json_safe(dataclasses.asdict(value))
+        return str(value)
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize context to a dictionary for persistence.
@@ -72,11 +99,11 @@ class PendingFeedbackContext:
             "flow_id": self.flow_id,
             "flow_class": self.flow_class,
             "method_name": self.method_name,
-            "method_output": self.method_output,
+            "method_output": self._make_json_safe(self.method_output),
             "message": self.message,
             "emit": self.emit,
             "default_outcome": self.default_outcome,
-            "metadata": self.metadata,
+            "metadata": self._make_json_safe(self.metadata),
             "llm": self.llm,
             "requested_at": self.requested_at.isoformat(),
         }
@@ -155,7 +182,7 @@ class HumanFeedbackPending(Exception):  # noqa: N818 - Not an error, a control f
                     callback_info={
                         "slack_channel": "#reviews",
                         "thread_id": ticket_id,
-                    }
+                    },
                 )
         ```
     """
@@ -232,7 +259,7 @@ class HumanFeedbackProvider(Protocol):
                     callback_info={
                         "channel": self.channel,
                         "thread_id": thread_id,
-                    }
+                    },
                 )
         ```
     """
@@ -240,7 +267,7 @@ class HumanFeedbackProvider(Protocol):
     def request_feedback(
         self,
         context: PendingFeedbackContext,
-        flow: Flow,
+        flow: Flow[Any],
     ) -> str:
         """Request feedback from a human.
 

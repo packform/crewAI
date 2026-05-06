@@ -5,7 +5,10 @@ from crewai.flow.async_feedback import (
     PendingFeedbackContext,
 )
 from crewai.flow.flow import Flow, and_, listen, or_, router, start
+from crewai.flow.flow_config import flow_config
+from crewai.flow.flow_serializer import flow_structure
 from crewai.flow.human_feedback import HumanFeedbackResult, human_feedback
+from crewai.flow.input_provider import InputProvider, InputResponse
 from crewai.flow.persistence import persist
 from crewai.flow.visualization import (
     FlowStructure,
@@ -21,9 +24,13 @@ __all__ = [
     "HumanFeedbackPending",
     "HumanFeedbackProvider",
     "HumanFeedbackResult",
+    "InputProvider",
+    "InputResponse",
     "PendingFeedbackContext",
     "and_",
     "build_flow_structure",
+    "flow_config",
+    "flow_structure",
     "human_feedback",
     "listen",
     "or_",

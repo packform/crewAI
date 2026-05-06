@@ -24,13 +24,13 @@ class TestHumanFeedbackValidation:
     """Tests for decorator parameter validation."""
 
     def test_emit_requires_llm(self):
-        """Test that specifying emit without llm raises ValueError."""
+        """Test that specifying emit with llm=None raises ValueError."""
         with pytest.raises(ValueError) as exc_info:
 
             @human_feedback(
                 message="Review this:",
                 emit=["approve", "reject"],
-                # llm not provided
+                llm=None,  # explicitly None
             )
             def test_method(self):
                 return "output"
@@ -246,7 +246,7 @@ class TestHumanFeedbackExecution:
     @patch("builtins.input", return_value="")
     @patch("builtins.print")
     def test_empty_feedback_with_default_outcome(self, mock_print, mock_input):
-        """Test empty feedback uses default_outcome."""
+        """Test empty feedback uses default_outcome for routing, but flow returns method output."""
 
         class TestFlow(Flow):
             @start()
@@ -264,14 +264,16 @@ class TestHumanFeedbackExecution:
         with patch.object(flow, "_request_human_feedback", return_value=""):
             result = flow.kickoff()
 
-        assert result == "needs_work"
+        # Flow result is the method's return value, NOT the collapsed outcome
+        assert result == "Content"
         assert flow.last_human_feedback is not None
+        # But the outcome is still correctly set for routing purposes
         assert flow.last_human_feedback.outcome == "needs_work"
 
     @patch("builtins.input", return_value="Approved!")
     @patch("builtins.print")
     def test_feedback_collapsing(self, mock_print, mock_input):
-        """Test that feedback is collapsed to an outcome."""
+        """Test that feedback is collapsed to an outcome for routing, but flow returns method output."""
 
         class TestFlow(Flow):
             @start()
@@ -291,8 +293,10 @@ class TestHumanFeedbackExecution:
         ):
             result = flow.kickoff()
 
-        assert result == "approved"
+        # Flow result is the method's return value, NOT the collapsed outcome
+        assert result == "Content"
         assert flow.last_human_feedback is not None
+        # But the outcome is still correctly set for routing purposes
         assert flow.last_human_feedback.outcome == "approved"
 
 
@@ -399,3 +403,354 @@ class TestCollapseToOutcome:
             )
 
         assert result == "approved"  # First in list
+
+    def test_both_llm_calls_fail_returns_first_outcome(self):
+        """When both structured and simple prompting fail, return outcomes[0]."""
+        flow = Flow()
+
+        with patch("crewai.llm.LLM") as MockLLM:
+            mock_llm = MagicMock()
+            # Both calls raise — simulates wrong provider / auth failure
+            mock_llm.call.side_effect = RuntimeError("Model not found")
+            MockLLM.return_value = mock_llm
+
+            result = flow._collapse_to_outcome(
+                feedback="looks great, approve it",
+                outcomes=["needs_changes", "approved"],
+                llm="gemini-3-flash-preview",
+            )
+
+        assert result == "needs_changes"  # First in list (safe fallback)
+
+    def test_structured_fails_but_simple_succeeds(self):
+        """When structured output fails but simple prompting works, use that."""
+        flow = Flow()
+
+        with patch("crewai.llm.LLM") as MockLLM:
+            mock_llm = MagicMock()
+            # First call (structured) fails, second call (simple) succeeds
+            mock_llm.call.side_effect = [
+                RuntimeError("Function calling not supported"),
+                "approved",
+            ]
+            MockLLM.return_value = mock_llm
+
+            result = flow._collapse_to_outcome(
+                feedback="looks great",
+                outcomes=["needs_changes", "approved"],
+                llm="gpt-4o-mini",
+            )
+
+        assert result == "approved"
+
+
+# -- HITL Learning tests --
+
+
+class TestHumanFeedbackLearn:
+    """Tests for the learn=True HITL learning feature."""
+
+    def test_learn_false_does_not_interact_with_memory(self):
+        """When learn=False (default), memory is never touched."""
+
+        class LearnOffFlow(Flow):
+            @start()
+            @human_feedback(message="Review:", learn=False)
+            def produce(self):
+                return "output"
+
+        flow = LearnOffFlow()
+        flow.memory = MagicMock()
+
+        with patch.object(
+            flow, "_request_human_feedback", return_value="looks good"
+        ):
+            flow.produce()
+
+        # memory.recall and memory.remember_many should NOT be called
+        flow.memory.recall.assert_not_called()
+        flow.memory.remember_many.assert_not_called()
+
+    def test_learn_true_stores_distilled_lessons(self):
+        """When learn=True and feedback has substance, lessons are distilled and stored."""
+
+        class LearnFlow(Flow):
+            @start()
+            @human_feedback(message="Review:", llm="gpt-4o-mini", learn=True)
+            def produce(self):
+                return "draft article"
+
+        flow = LearnFlow()
+        flow.memory = MagicMock()
+        flow.memory.recall.return_value = []  # no prior lessons
+
+        with (
+            patch.object(
+                flow, "_request_human_feedback", return_value="Always add citations"
+            ),
+            patch("crewai.llm.LLM") as MockLLM,
+        ):
+            from crewai.flow.human_feedback import DistilledLessons
+
+            mock_llm = MagicMock()
+            mock_llm.supports_function_calling.return_value = True
+            # Distillation call -> returns structured lessons
+            mock_llm.call.return_value = DistilledLessons(
+                lessons=["Always include source citations when making factual claims"]
+            )
+            MockLLM.return_value = mock_llm
+
+            flow.produce()
+
+        # remember_many should be called with the distilled lesson
+        flow.memory.remember_many.assert_called_once()
+        lessons = flow.memory.remember_many.call_args.args[0]
+        assert len(lessons) == 1
+        assert "citations" in lessons[0].lower()
+        # source should be "hitl"
+        assert flow.memory.remember_many.call_args.kwargs.get("source") == "hitl"
+
+    def test_learn_true_pre_reviews_with_past_lessons(self):
+        """When learn=True and past lessons exist, output is pre-reviewed before human sees it."""
+        from crewai.memory.types import MemoryMatch, MemoryRecord
+
+        class LearnFlow(Flow):
+            @start()
+            @human_feedback(message="Review:", llm="gpt-4o-mini", learn=True)
+            def produce(self):
+                return "draft without citations"
+
+        flow = LearnFlow()
+        # Mock memory with a past lesson
+        flow.memory = MagicMock()
+        flow.memory.recall.return_value = [
+            MemoryMatch(
+                record=MemoryRecord(
+                    content="Always include source citations when making factual claims",
+                    embedding=[],
+                ),
+                score=0.9,
+                match_reasons=["semantic"],
+            )
+        ]
+
+        captured_output = {}
+
+        def capture_feedback(message, output, metadata=None, emit=None):
+            captured_output["shown_to_human"] = output
+            return "approved"
+
+        with (
+            patch.object(flow, "_request_human_feedback", side_effect=capture_feedback),
+            patch("crewai.llm.LLM") as MockLLM,
+        ):
+            from crewai.flow.human_feedback import DistilledLessons, PreReviewResult
+
+            mock_llm = MagicMock()
+            mock_llm.supports_function_calling.return_value = True
+            # Pre-review returns structured improved output, distillation returns empty lessons
+            mock_llm.call.side_effect = [
+                PreReviewResult(improved_output="draft with citations added"),
+                DistilledLessons(lessons=[]),  # "approved" has no new lessons
+            ]
+            MockLLM.return_value = mock_llm
+
+            flow.produce()
+
+        # The human should have seen the pre-reviewed output, not the raw output
+        assert captured_output["shown_to_human"] == "draft with citations added"
+        # recall was called to find past lessons
+        flow.memory.recall.assert_called_once()
+
+    def test_learn_true_empty_feedback_does_not_store(self):
+        """When learn=True but feedback is empty, no lessons are stored."""
+
+        class LearnFlow(Flow):
+            @start()
+            @human_feedback(message="Review:", llm="gpt-4o-mini", learn=True)
+            def produce(self):
+                return "output"
+
+        flow = LearnFlow()
+        flow.memory = MagicMock()
+        flow.memory.recall.return_value = []
+
+        with patch.object(
+            flow, "_request_human_feedback", return_value=""
+        ):
+            flow.produce()
+
+        # Empty feedback -> no distillation, no storage
+        flow.memory.remember_many.assert_not_called()
+
+    def test_learn_true_uses_default_llm(self):
+        """When learn=True and llm is not explicitly set, the default gpt-4o-mini is used."""
+
+        @human_feedback(message="Review:", learn=True)
+        def test_method(self):
+            return "output"
+
+        config = test_method.__human_feedback_config__
+        assert config is not None
+        assert config.learn is True
+        # llm defaults to "gpt-4o-mini" at the function level
+        assert config.llm == "gpt-4o-mini"
+
+
+class TestHumanFeedbackFinalOutputPreservation:
+    """Tests for preserving method return value as flow's final output when @human_feedback with emit is terminal.
+
+    This addresses the bug where the flow's final output was the collapsed outcome string (e.g., 'approved')
+    instead of the method's actual return value when a @human_feedback method with emit is the final method.
+    """
+
+    @patch("builtins.input", return_value="Looks good!")
+    @patch("builtins.print")
+    def test_final_output_is_method_return_not_collapsed_outcome(
+        self, mock_print, mock_input
+    ):
+        """When @human_feedback with emit is the final method, flow output is the method's return value."""
+
+        class FinalHumanFeedbackFlow(Flow):
+            @start()
+            @human_feedback(
+                message="Review this content:",
+                emit=["approved", "rejected"],
+                llm="gpt-4o-mini",
+            )
+            def generate_and_review(self):
+                # This dict should be the final output, NOT the string 'approved'
+                return {"title": "My Article", "content": "Article content here", "status": "ready"}
+
+        flow = FinalHumanFeedbackFlow()
+
+        with (
+            patch.object(flow, "_request_human_feedback", return_value="Looks great, approved!"),
+            patch.object(flow, "_collapse_to_outcome", return_value="approved"),
+        ):
+            result = flow.kickoff()
+
+        # The final output should be the actual method return value, not the collapsed outcome
+        assert isinstance(result, dict), f"Expected dict, got {type(result).__name__}: {result}"
+        assert result == {"title": "My Article", "content": "Article content here", "status": "ready"}
+        # But the outcome should still be tracked in last_human_feedback
+        assert flow.last_human_feedback is not None
+        assert flow.last_human_feedback.outcome == "approved"
+
+    @patch("builtins.input", return_value="approved")
+    @patch("builtins.print")
+    def test_routing_still_works_with_downstream_listener(self, mock_print, mock_input):
+        """When @human_feedback has a downstream listener, routing still triggers the listener."""
+        publish_called = []
+
+        class RoutingFlow(Flow):
+            @start()
+            @human_feedback(
+                message="Review:",
+                emit=["approved", "rejected"],
+                llm="gpt-4o-mini",
+            )
+            def review(self):
+                return {"content": "original content"}
+
+            @listen("approved")
+            def publish(self):
+                publish_called.append(True)
+                return {"published": True, "timestamp": "2024-01-01"}
+
+        flow = RoutingFlow()
+
+        with (
+            patch.object(flow, "_request_human_feedback", return_value="LGTM"),
+            patch.object(flow, "_collapse_to_outcome", return_value="approved"),
+        ):
+            result = flow.kickoff()
+
+        # The downstream listener should have been triggered
+        assert len(publish_called) == 1, "publish() should have been called"
+        # The final output should be from the listener, not the human_feedback method
+        assert result == {"published": True, "timestamp": "2024-01-01"}
+
+    @patch("builtins.input", return_value="")
+    @patch("builtins.print")
+    @pytest.mark.asyncio
+    async def test_async_human_feedback_final_output_preserved(self, mock_print, mock_input):
+        """Async @human_feedback methods also preserve the real return value."""
+
+        class AsyncFinalFlow(Flow):
+            @start()
+            @human_feedback(
+                message="Review async content:",
+                emit=["approved", "rejected"],
+                llm="gpt-4o-mini",
+                default_outcome="approved",
+            )
+            async def async_generate(self):
+                return {"async_data": "value", "computed": 42}
+
+        flow = AsyncFinalFlow()
+
+        with (
+            patch.object(flow, "_request_human_feedback", return_value=""),
+        ):
+            result = await flow.kickoff_async()
+
+        # The final output should be the dict, not "approved"
+        assert isinstance(result, dict), f"Expected dict, got {type(result).__name__}: {result}"
+        assert result == {"async_data": "value", "computed": 42}
+        assert flow.last_human_feedback.outcome == "approved"
+
+    @patch("builtins.input", return_value="feedback")
+    @patch("builtins.print")
+    def test_method_outputs_contains_real_output(self, mock_print, mock_input):
+        """The _method_outputs list should contain the real method output, not the collapsed outcome."""
+
+        class OutputTrackingFlow(Flow):
+            @start()
+            @human_feedback(
+                message="Review:",
+                emit=["approved", "rejected"],
+                llm="gpt-4o-mini",
+            )
+            def generate(self):
+                return {"data": "real output"}
+
+        flow = OutputTrackingFlow()
+
+        with (
+            patch.object(flow, "_request_human_feedback", return_value="approved"),
+            patch.object(flow, "_collapse_to_outcome", return_value="approved"),
+        ):
+            flow.kickoff()
+
+        # _method_outputs should contain the real output
+        assert len(flow._method_outputs) == 1
+        assert flow._method_outputs[0] == {"data": "real output"}
+
+    @patch("builtins.input", return_value="looks good")
+    @patch("builtins.print")
+    def test_none_return_value_is_preserved(self, mock_print, mock_input):
+        """A method returning None should preserve None as flow output, not the outcome string."""
+
+        class NoneReturnFlow(Flow):
+            @start()
+            @human_feedback(
+                message="Review:",
+                emit=["approved", "rejected"],
+                llm="gpt-4o-mini",
+            )
+            def process(self):
+                # Method does work but returns None (implicit)
+                pass
+
+        flow = NoneReturnFlow()
+
+        with (
+            patch.object(flow, "_request_human_feedback", return_value=""),
+            patch.object(flow, "_collapse_to_outcome", return_value="approved"),
+        ):
+            result = flow.kickoff()
+
+        # Final output should be None (the method's real return), not "approved"
+        assert result is None, f"Expected None, got {result!r}"
+        assert flow.last_human_feedback.outcome == "approved"

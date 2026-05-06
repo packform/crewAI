@@ -1,14 +1,49 @@
+from contextvars import ContextVar
+import os
 import threading
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 
 from rich.console import Console
 from rich.live import Live
 from rich.panel import Panel
 from rich.text import Text
 
+from crewai.cli.version import is_current_version_yanked, is_newer_version_available
+
+
+_disable_version_check: ContextVar[bool] = ContextVar(
+    "_disable_version_check", default=False
+)
+
+_suppress_console_output: ContextVar[bool] = ContextVar(
+    "_suppress_console_output", default=False
+)
+
+
+def set_suppress_console_output(suppress: bool) -> object:
+    """Set whether to suppress all console output.
+
+    Args:
+        suppress: True to suppress output, False to show it.
+
+    Returns:
+        A token that can be used to restore the previous value.
+    """
+    return _suppress_console_output.set(suppress)
+
+
+def should_suppress_console_output() -> bool:
+    """Check if console output should be suppressed.
+
+    Returns:
+        True if output should be suppressed, False otherwise.
+    """
+    return _suppress_console_output.get()
+
 
 class ConsoleFormatter:
     tool_usage_counts: ClassVar[dict[str, int]] = {}
+    _tool_counts_lock: ClassVar[threading.Lock] = threading.Lock()
 
     current_a2a_turn_count: int = 0
     _pending_a2a_message: str | None = None
@@ -35,12 +70,80 @@ class ConsoleFormatter:
             padding=(1, 2),
         )
 
+    def _show_version_update_message_if_needed(self) -> None:
+        """Show version update message if a newer version is available.
+
+        Only displays when verbose mode is enabled and not running in CI/CD.
+        """
+        if not self.verbose:
+            return
+
+        if _disable_version_check.get():
+            return
+
+        if os.getenv("CI", "").lower() in ("true", "1"):
+            return
+
+        if os.getenv("CREWAI_DISABLE_VERSION_CHECK", "").lower() in ("true", "1"):
+            return
+
+        try:
+            is_newer, current, latest = is_newer_version_available()
+            if is_newer and latest:
+                message = f"""A new version of CrewAI is available!
+
+Current version: {current}
+Latest version:  {latest}
+
+To update, run: uv sync --upgrade-package crewai"""
+
+                panel = Panel(
+                    message,
+                    title="✨ Update Available ✨",
+                    border_style="yellow",
+                    padding=(1, 2),
+                )
+                self.console.print(panel)
+                self.console.print()
+
+            is_yanked, yanked_reason = is_current_version_yanked()
+            if is_yanked:
+                yanked_message = f"Version {current} has been yanked from PyPI."
+                if yanked_reason:
+                    yanked_message += f"\nReason: {yanked_reason}"
+                yanked_message += "\n\nTo update, run: uv sync --upgrade-package crewai"
+
+                yanked_panel = Panel(
+                    yanked_message,
+                    title="Yanked Version",
+                    border_style="red",
+                    padding=(1, 2),
+                )
+                self.console.print(yanked_panel)
+                self.console.print()
+        except Exception:  # noqa: S110
+            # Silently ignore errors in version check - it's non-critical
+            pass
+
     def _show_tracing_disabled_message_if_needed(self) -> None:
         """Show tracing disabled message if tracing is not enabled."""
+        from crewai.events.listeners.tracing.trace_listener import (
+            TraceCollectionListener,
+        )
         from crewai.events.listeners.tracing.utils import (
             has_user_declined_tracing,
             is_tracing_enabled_in_context,
+            should_suppress_tracing_messages,
         )
+
+        if should_suppress_tracing_messages():
+            return
+
+        # Don't show "disabled" message when the first-time handler will show
+        # the trace prompt after execution completes (avoids confusing mid-flow messages)
+        listener = TraceCollectionListener._instance  # type: ignore[misc]
+        if listener and listener.first_time_handler.is_first_time:
+            return
 
         if not is_tracing_enabled_in_context():
             if has_user_declined_tracing():
@@ -77,22 +180,24 @@ To enable tracing, do any one of these:
         """Create standardized status content with consistent formatting."""
         content = Text()
         content.append(f"{title}\n", style=f"{status_style} bold")
-        content.append("Name: \n", style="white")
+        content.append("Name: ", style="white")
         content.append(f"{name}\n", style=status_style)
 
         for label, value in fields.items():
-            content.append(f"{label}: \n", style="white")
+            content.append(f"{label}: ", style="white")
             content.append(
                 f"{value}\n", style=fields.get(f"{label}_style", status_style)
             )
         if tool_args:
-            content.append("Tool Args: \n", style="white")
+            content.append("Tool Args: ", style="white")
             content.append(f"{tool_args}\n", style=status_style)
 
         return content
 
     def print(self, *args: Any, **kwargs: Any) -> None:
         """Print to console. Simplified to only handle panel-based output."""
+        if should_suppress_console_output():
+            return
         # Skip blank lines during streaming
         if len(args) == 0 and self._is_streaming:
             return
@@ -114,7 +219,6 @@ To enable tracing, do any one of these:
         New streaming sessions will be created on-demand when needed.
         This method exists for API compatibility with HITL callers.
         """
-        pass
 
     def print_panel(
         self, content: Text, title: str, style: str = "blue", is_flow: bool = False
@@ -177,8 +281,9 @@ To enable tracing, do any one of these:
         if not self.verbose:
             return
 
-        # Reset the crew completion event for this new crew execution
         ConsoleFormatter.crew_completion_printed.clear()
+
+        self._show_version_update_message_if_needed()
 
         content = self.create_status_content(
             "Crew Execution Started",
@@ -238,6 +343,8 @@ To enable tracing, do any one of these:
 
     def handle_flow_started(self, flow_name: str, flow_id: str) -> None:
         """Show flow started panel."""
+        self._show_version_update_message_if_needed()
+
         content = Text()
         content.append("Flow Started\n", style="blue bold")
         content.append("Name: ", style="white")
@@ -348,9 +455,11 @@ To enable tracing, do any one of these:
         if not self.verbose:
             return
 
-        # Update tool usage count
-        self.tool_usage_counts[tool_name] = self.tool_usage_counts.get(tool_name, 0) + 1
-        iteration = self.tool_usage_counts[tool_name]
+        with self._tool_counts_lock:
+            self.tool_usage_counts[tool_name] = (
+                self.tool_usage_counts.get(tool_name, 0) + 1
+            )
+            iteration = self.tool_usage_counts[tool_name]
 
         content = Text()
         content.append("Tool: ", style="white")
@@ -367,6 +476,33 @@ To enable tracing, do any one of these:
 
         self.print_panel(content, f"🔧 Tool Execution Started (#{iteration})", "yellow")
 
+    def handle_tool_usage_finished(
+        self,
+        tool_name: str,
+        output: str,
+        run_attempts: int | None = None,
+    ) -> None:
+        """Handle tool usage finished event with panel display."""
+        if not self.verbose:
+            return
+
+        with self._tool_counts_lock:
+            iteration = self.tool_usage_counts.get(tool_name, 1)
+
+        content = Text()
+        content.append("Tool Completed\n", style="green bold")
+        content.append("Tool: ", style="white")
+        content.append(f"{tool_name}\n", style="green bold")
+
+        if output:
+            content.append("Output: ", style="white")
+
+            content.append(f"{output}\n", style="green")
+
+        self.print_panel(
+            content, f"✅ Tool Execution Completed (#{iteration})", "green"
+        )
+
     def handle_tool_usage_error(
         self,
         tool_name: str,
@@ -377,7 +513,8 @@ To enable tracing, do any one of these:
         if not self.verbose:
             return
 
-        iteration = self.tool_usage_counts.get(tool_name, 1)
+        with self._tool_counts_lock:
+            iteration = self.tool_usage_counts.get(tool_name, 1)
 
         content = Text()
         content.append("Tool Failed\n", style="red bold")
@@ -419,6 +556,9 @@ To enable tracing, do any one of these:
             call_type: The type of LLM call (LLM_CALL or TOOL_CALL).
         """
         if not self.verbose:
+            return
+
+        if should_suppress_console_output():
             return
 
         self._is_streaming = True
@@ -611,6 +751,27 @@ To enable tracing, do any one of these:
 
         self.print_panel(content, title, style)
 
+    @staticmethod
+    def _simplify_tools_field(fields: dict[str, Any]) -> dict[str, Any]:
+        """Simplify the tools field to show only tool names instead of full definitions.
+
+        Args:
+            fields: Dictionary of fields that may contain a 'tools' key with
+                    full tool objects.
+
+        Returns:
+            The fields dictionary with 'tools' replaced by a comma-separated
+            string of tool names.
+        """
+        if "tools" in fields:
+            tools = fields["tools"]
+            if tools:
+                tool_names = [getattr(t, "name", str(t)) for t in tools]
+                fields["tools"] = ", ".join(tool_names) if tool_names else "None"
+            else:
+                fields["tools"] = "None"
+        return fields
+
     def handle_lite_agent_execution(
         self,
         lite_agent_role: str,
@@ -621,6 +782,8 @@ To enable tracing, do any one of these:
         """Handle lite agent execution events with panel display."""
         if not self.verbose:
             return
+
+        fields = self._simplify_tools_field(fields)
 
         if status == "started":
             self.create_lite_agent_branch(lite_agent_role)
@@ -787,6 +950,152 @@ To enable tracing, do any one of these:
         )
         self.print_panel(error_content, "❌ Reasoning Error", "red")
 
+    # ----------- OBSERVATION EVENTS (Plan-and-Execute) -----------
+
+    def handle_observation_started(
+        self,
+        agent_role: str,
+        step_number: int,
+        step_description: str,
+    ) -> None:
+        """Handle step observation started event."""
+        if not self.verbose:
+            return
+
+        content = Text()
+        content.append("Observation Started\n", style="cyan bold")
+        content.append("Agent: ", style="white")
+        content.append(f"{agent_role}\n", style="cyan")
+        content.append("Step: ", style="white")
+        content.append(f"{step_number}\n", style="cyan")
+        if step_description:
+            desc_preview = step_description[:80] + (
+                "..." if len(step_description) > 80 else ""
+            )
+            content.append("Description: ", style="white")
+            content.append(f"{desc_preview}\n", style="cyan")
+
+        self.print_panel(content, "🔍 Observing Step Result", "cyan")
+
+    def handle_observation_completed(
+        self,
+        agent_role: str,
+        step_number: int,
+        step_completed: bool,
+        plan_valid: bool,
+        key_info: str,
+        needs_replan: bool,
+        goal_achieved: bool,
+    ) -> None:
+        """Handle step observation completed event."""
+        if not self.verbose:
+            return
+
+        if goal_achieved:
+            style = "green"
+            status = "Goal Achieved Early"
+        elif needs_replan:
+            style = "yellow"
+            status = "Replan Needed"
+        elif plan_valid:
+            style = "green"
+            status = "Plan Valid — Continue"
+        else:
+            style = "red"
+            status = "Step Failed"
+
+        content = Text()
+        content.append("Observation Complete\n", style=f"{style} bold")
+        content.append("Step: ", style="white")
+        content.append(f"{step_number}\n", style=style)
+        content.append("Status: ", style="white")
+        content.append(f"{status}\n", style=style)
+        if key_info:
+            info_preview = key_info[:120] + ("..." if len(key_info) > 120 else "")
+            content.append("Learned: ", style="white")
+            content.append(f"{info_preview}\n", style=style)
+
+        self.print_panel(content, "🔍 Observation Result", style)
+
+    def handle_observation_failed(
+        self,
+        step_number: int,
+        error: str,
+    ) -> None:
+        """Handle step observation failure event."""
+        if not self.verbose:
+            return
+
+        error_content = self.create_status_content(
+            "Observation Failed",
+            "Error",
+            "red",
+            Step=str(step_number),
+            Error=error,
+        )
+        self.print_panel(error_content, "❌ Observation Error", "red")
+
+    def handle_plan_refinement(
+        self,
+        step_number: int,
+        refined_count: int,
+        refinements: list[str] | None,
+    ) -> None:
+        """Handle plan refinement event."""
+        if not self.verbose:
+            return
+
+        content = Text()
+        content.append("Plan Refined\n", style="cyan bold")
+        content.append("After Step: ", style="white")
+        content.append(f"{step_number}\n", style="cyan")
+        content.append("Steps Updated: ", style="white")
+        content.append(f"{refined_count}\n", style="cyan")
+        if refinements:
+            for r in refinements[:3]:
+                content.append(f"  • {r[:80]}\n", style="white")
+
+        self.print_panel(content, "✏️ Plan Refinement", "cyan")
+
+    def handle_plan_replan(
+        self,
+        reason: str,
+        replan_count: int,
+        preserved_count: int,
+    ) -> None:
+        """Handle plan replan triggered event."""
+        if not self.verbose:
+            return
+
+        content = Text()
+        content.append("Full Replan Triggered\n", style="yellow bold")
+        content.append("Reason: ", style="white")
+        content.append(f"{reason}\n", style="yellow")
+        content.append("Replan #: ", style="white")
+        content.append(f"{replan_count}\n", style="yellow")
+        content.append("Preserved Steps: ", style="white")
+        content.append(f"{preserved_count}\n", style="yellow")
+
+        self.print_panel(content, "🔄 Dynamic Replan", "yellow")
+
+    def handle_goal_achieved_early(
+        self,
+        steps_completed: int,
+        steps_remaining: int,
+    ) -> None:
+        """Handle goal achieved early event."""
+        if not self.verbose:
+            return
+
+        content = Text()
+        content.append("Goal Achieved Early!\n", style="green bold")
+        content.append("Completed: ", style="white")
+        content.append(f"{steps_completed} steps\n", style="green")
+        content.append("Skipped: ", style="white")
+        content.append(f"{steps_remaining} remaining steps\n", style="green")
+
+        self.print_panel(content, "🎯 Early Goal Achievement", "green")
+
     # ----------- AGENT LOGGING EVENTS -----------
 
     def handle_agent_logs_started(
@@ -860,7 +1169,7 @@ To enable tracing, do any one of these:
 
             is_a2a_delegation = False
             try:
-                output_data = json.loads(formatted_answer.output)
+                output_data = json.loads(cast(str, formatted_answer.output))
                 if isinstance(output_data, dict):
                     if output_data.get("is_a2a") is True:
                         is_a2a_delegation = True
@@ -1363,6 +1672,34 @@ To enable tracing, do any one of these:
         self.print(panel)
         self.print()
 
+    def handle_mcp_config_fetch_failed(
+        self,
+        slug: str,
+        error: str = "",
+        error_type: str | None = None,
+    ) -> None:
+        """Handle MCP config fetch failed event (AMP resolution failures)."""
+        if not self.verbose:
+            return
+
+        content = Text()
+        content.append("MCP Config Fetch Failed\n\n", style="red bold")
+        content.append("Server: ", style="white")
+        content.append(f"{slug}\n", style="red")
+
+        if error_type:
+            content.append("Error Type: ", style="white")
+            content.append(f"{error_type}\n", style="red")
+
+        if error:
+            content.append("\nError: ", style="white bold")
+            error_preview = error[:500] + "..." if len(error) > 500 else error
+            content.append(f"{error_preview}\n", style="red")
+
+        panel = self.create_panel(content, "❌ MCP Config Failed", "red")
+        self.print(panel)
+        self.print()
+
     def handle_mcp_tool_execution_started(
         self,
         server_name: str,
@@ -1417,3 +1754,49 @@ To enable tracing, do any one of these:
         panel = self.create_panel(content, "❌ MCP Tool Failed", "red")
         self.print(panel)
         self.print()
+
+    def handle_a2a_polling_started(
+        self,
+        task_id: str,
+        polling_interval: float,
+        endpoint: str,
+    ) -> None:
+        """Handle A2A polling started event with panel display."""
+        content = Text()
+        content.append("A2A Polling Started\n", style="cyan bold")
+        content.append("Task ID: ", style="white")
+        content.append(f"{task_id[:8]}...\n", style="cyan")
+        content.append("Interval: ", style="white")
+        content.append(f"{polling_interval}s\n", style="cyan")
+
+        self.print_panel(content, "⏳ A2A Polling", "cyan")
+
+    def handle_a2a_polling_status(
+        self,
+        task_id: str,
+        state: str,
+        elapsed_seconds: float,
+        poll_count: int,
+    ) -> None:
+        """Handle A2A polling status event with panel display."""
+        if state == "completed":
+            style = "green"
+            status_indicator = "✓"
+        elif state == "failed":
+            style = "red"
+            status_indicator = "✗"
+        elif state == "working":
+            style = "yellow"
+            status_indicator = "⋯"
+        else:
+            style = "cyan"
+            status_indicator = "•"
+
+        content = Text()
+        content.append(f"Poll #{poll_count}\n", style=f"{style} bold")
+        content.append("Status: ", style="white")
+        content.append(f"{status_indicator} {state}\n", style=style)
+        content.append("Elapsed: ", style="white")
+        content.append(f"{elapsed_seconds:.1f}s\n", style=style)
+
+        self.print_panel(content, f"📊 A2A Poll #{poll_count}", style)
