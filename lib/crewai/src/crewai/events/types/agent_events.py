@@ -72,7 +72,7 @@ class LiteAgentExecutionStartedEvent(BaseEvent):
 
     agent_info: dict[str, Any]
     tools: Sequence[BaseTool | CrewStructuredTool] | None
-    messages: str | list[dict[str, str]]
+    messages: str | list[dict[str, Any]]
     type: Literal["lite_agent_execution_started"] = "lite_agent_execution_started"
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
